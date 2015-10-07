@@ -19,6 +19,7 @@ func NewProvider() Server {
 	return Server{
 		server: rpc.NewServer(),
 		rwc:    rwCloser{os.Stdin, os.Stdout},
+		// rwc:    rwCloser{NewTeeReadCloser(os.Stdin, os.Stderr), NewMultiWriteCloser(os.Stdout, os.Stderr)},
 	}
 }
 
@@ -134,10 +135,61 @@ func NewConsumerCodec(f func(io.ReadWriteCloser) rpc.ClientCodec) *rpc.Client {
 	return rpc.NewClientWithCodec(f(rwCloser{os.Stdin, os.Stdout}))
 }
 
+type PrefixWriter struct {
+	w      io.Writer
+	prefix string
+}
+
+func (pw PrefixWriter) Write(p []byte) (n int, err error) {
+	written, err := pw.w.Write(append([]byte(pw.prefix), p...))
+	return written - len(pw.prefix), err
+}
+
+type TeeReadCloser struct {
+	r    io.ReadCloser
+	rNew io.Reader
+}
+
+func NewTeeReadCloser(r io.ReadCloser, w io.Writer) TeeReadCloser {
+	return TeeReadCloser{
+		r,
+		io.TeeReader(r, w),
+	}
+}
+
+func (trc TeeReadCloser) Read(p []byte) (n int, err error) {
+	return trc.rNew.Read(p)
+}
+
+func (trc TeeReadCloser) Close() error {
+	return trc.r.Close()
+}
+
+type MultiWriteCloser struct {
+	wc io.WriteCloser
+	mw io.Writer
+}
+
+func NewMultiWriteCloser(wc io.WriteCloser, w io.Writer) MultiWriteCloser {
+	return MultiWriteCloser{
+		wc,
+		io.MultiWriter(wc, w),
+	}
+}
+
+func (mwc MultiWriteCloser) Write(p []byte) (n int, err error) {
+	return mwc.mw.Write(p)
+}
+
+func (mwc MultiWriteCloser) Close() error {
+	return mwc.wc.Close()
+}
+
 // start runs the plugin and returns an ioPipe that can be used to control the
 // plugin.
 func start(cmd commander) (_ ioPipe, err error) {
-	in, err := cmd.StdinPipe()
+	inRaw, err := cmd.StdinPipe()
+	in := NewMultiWriteCloser(inRaw, PrefixWriter{os.Stderr, "JSON-RPC-stdin: "})
 	if err != nil {
 		return ioPipe{}, err
 	}
@@ -146,7 +198,8 @@ func start(cmd commander) (_ ioPipe, err error) {
 			in.Close()
 		}
 	}()
-	out, err := cmd.StdoutPipe()
+	outRaw, err := cmd.StdoutPipe()
+	out := NewTeeReadCloser(outRaw, PrefixWriter{os.Stderr, "JSON-RPC-stdout: "})
 	if err != nil {
 		return ioPipe{}, err
 	}
